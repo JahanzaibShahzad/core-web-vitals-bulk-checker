@@ -1,0 +1,4 @@
+# Example URL list for check_vitals.py
+# One URL per line. Lines starting with # and blank lines are ignored.
+https://example.com
+https://www.google.com

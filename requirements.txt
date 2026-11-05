@@ -1,0 +1,3 @@
+# No third-party dependencies.
+# The checker uses only the Python 3 standard library (urllib, csv, json, argparse).
+# Python 3.8 or newer is required.
