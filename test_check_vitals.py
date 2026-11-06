@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Tests for check_vitals.py. Run with: python -m unittest test_check_vitals -v"""
 
+import io
 import json
 import os
 import tempfile
 import unittest
+import urllib.error
+from unittest import mock
 
 import check_vitals
 
@@ -67,6 +70,58 @@ class TestThresholds(unittest.TestCase):
         self.assertEqual(check_vitals.THRESHOLDS["lcp_ms"], 2500)
         self.assertEqual(check_vitals.THRESHOLDS["inp_ms"], 200)
         self.assertAlmostEqual(check_vitals.THRESHOLDS["cls"], 0.1)
+
+
+def _http_error(code):
+    body = io.BytesIO(json.dumps({"error": {"message": "error {}".format(code)}}).encode("utf-8"))
+    return urllib.error.HTTPError("https://example.com", code, "error", {}, body)
+
+
+class TestRetries(unittest.TestCase):
+    def _ok_response(self):
+        body = io.StringIO(json.dumps(load_fixture("psi_response_good.json")))
+        response = mock.MagicMock()
+        response.__enter__.return_value = body
+        response.__exit__.return_value = False
+        return response
+
+    @mock.patch("check_vitals.time.sleep")
+    @mock.patch("check_vitals.urllib.request.urlopen")
+    def test_retries_after_rate_limit_then_succeeds(self, mock_urlopen, mock_sleep):
+        mock_urlopen.side_effect = [
+            _http_error(429),
+            _http_error(429),
+            self._ok_response(),
+        ]
+        data = check_vitals.fetch_psi_result("https://example.com", "mobile", None, retries=2)
+        self.assertEqual(mock_urlopen.call_count, 3)
+        self.assertEqual(data["lighthouseResult"]["audits"]["largest-contentful-paint"]["numericValue"], 1800)
+        self.assertEqual(mock_sleep.call_count, 2)
+
+    @mock.patch("check_vitals.time.sleep")
+    @mock.patch("check_vitals.urllib.request.urlopen")
+    def test_no_retry_on_client_error(self, mock_urlopen, mock_sleep):
+        mock_urlopen.side_effect = _http_error(400)
+        with self.assertRaises(urllib.error.HTTPError):
+            check_vitals.fetch_psi_result("https://example.com", "mobile", None, retries=2)
+        self.assertEqual(mock_urlopen.call_count, 1)
+        mock_sleep.assert_not_called()
+
+    @mock.patch("check_vitals.time.sleep")
+    @mock.patch("check_vitals.urllib.request.urlopen")
+    def test_retries_exhausted_raises(self, mock_urlopen, mock_sleep):
+        mock_urlopen.side_effect = _http_error(500)
+        with self.assertRaises(urllib.error.HTTPError):
+            check_vitals.fetch_psi_result("https://example.com", "mobile", None, retries=2)
+        self.assertEqual(mock_urlopen.call_count, 3)
+        self.assertEqual(mock_sleep.call_count, 2)
+
+    def test_is_retryable_status(self):
+        self.assertTrue(check_vitals.is_retryable_status(429))
+        self.assertTrue(check_vitals.is_retryable_status(500))
+        self.assertTrue(check_vitals.is_retryable_status(503))
+        self.assertFalse(check_vitals.is_retryable_status(400))
+        self.assertFalse(check_vitals.is_retryable_status(404))
 
 
 if __name__ == "__main__":

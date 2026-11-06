@@ -36,11 +36,20 @@ THRESHOLDS = {
 }
 
 
-def fetch_psi_result(url, strategy, api_key, timeout=60):
+def is_retryable_status(code):
+    """True for transient HTTP statuses worth retrying: rate limiting (429)
+    and server errors (5xx). Client errors such as 400 or 404 are not
+    retryable, retrying them would only burn quota."""
+    return code == 429 or 500 <= code < 600
+
+
+def fetch_psi_result(url, strategy, api_key, timeout=60, retries=2):
     """Call the PageSpeed Insights API for one URL and strategy.
 
-    Returns the parsed JSON response dict, or raises urllib.error.URLError
-    / HTTPError on failure.
+    Returns the parsed JSON response dict. Transient failures (HTTP 429
+    rate limits and 5xx server errors) are retried with exponential
+    backoff, up to ``retries`` times. Other errors raise
+    urllib.error.URLError / HTTPError as before.
     """
     params = {
         "url": url,
@@ -51,8 +60,28 @@ def fetch_psi_result(url, strategy, api_key, timeout=60):
         params["key"] = api_key
     request_url = API_URL + "?" + urllib.parse.urlencode(params)
     request = urllib.request.Request(request_url, headers={"User-Agent": "core-web-vitals-bulk-checker"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.load(response)
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if not is_retryable_status(exc.code) or attempt == retries:
+                raise
+            wait = 2 ** attempt
+            print("HTTP {} for {} ({}), retrying in {}s...".format(
+                exc.code, url, strategy, wait), file=sys.stderr)
+            time.sleep(wait)
+        except urllib.error.URLError as exc:
+            last_error = exc
+            if attempt == retries:
+                raise
+            wait = 2 ** attempt
+            print("Request failed for {} ({}), retrying in {}s: {}".format(
+                url, strategy, wait, exc.reason), file=sys.stderr)
+            time.sleep(wait)
+    raise last_error  # pragma: no cover - loop always raises or returns
 
 
 def extract_metrics(data):
@@ -114,11 +143,11 @@ def extract_metrics(data):
     }
 
 
-def check_url(url, strategy, api_key):
+def check_url(url, strategy, api_key, retries=2):
     """Check one URL and return a flat dict ready for CSV output."""
     row = {"url": url, "strategy": strategy, "error": ""}
     try:
-        data = fetch_psi_result(url, strategy, api_key)
+        data = fetch_psi_result(url, strategy, api_key, retries=retries)
     except urllib.error.HTTPError as exc:
         try:
             detail = json.load(exc).get("error", {}).get("message", "")
@@ -186,6 +215,10 @@ def main(argv=None):
                         help="PageSpeed Insights API key (or set PSI_API_KEY).")
     parser.add_argument("--delay", type=float, default=2.0,
                         help="Seconds to wait between API calls (default: 2).")
+    parser.add_argument("--retries", type=int, default=2,
+                        help="Retries for transient errors such as HTTP 429 "
+                        "rate limits and 5xx server errors (default: 2, "
+                        "use 0 to disable).")
     args = parser.parse_args(argv)
 
     try:
@@ -208,7 +241,7 @@ def main(argv=None):
             for strategy in strategies:
                 done += 1
                 print("[{}/{}] {} ({})".format(done, total, url, strategy))
-                row = check_url(url, strategy, args.api_key)
+                row = check_url(url, strategy, args.api_key, retries=args.retries)
                 writer.writerow({field: row.get(field, "") for field in CSV_FIELDS})
                 if done < total:
                     time.sleep(args.delay)

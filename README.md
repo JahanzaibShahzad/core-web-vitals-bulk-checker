@@ -65,7 +65,14 @@ python check_vitals.py --input urls.txt --output results.csv --api-key YOUR_KEY
 
 # Wait 5 seconds between calls (helps stay inside the API rate limit)
 python check_vitals.py --input urls.txt --output results.csv --delay 5
+
+# Retry each URL up to 5 times on rate limits (HTTP 429) and server errors
+python check_vitals.py --input urls.txt --output results.csv --retries 5
 ```
+
+Transient failures are retried automatically: HTTP 429 rate limits and
+5xx server errors are retried with exponential backoff (1s, 2s, 4s...),
+2 retries by default. Client errors such as 400 or 404 are not retried.
 
 ## Output
 
